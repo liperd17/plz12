@@ -31,6 +31,9 @@ const PLAYER_MAX_LEVEL = 20;
 const PLAYER_START_XP_REQUIREMENT = 10;
 const PLAYER_XP_REQUIREMENT_STEP = 5;
 const MONSTER_LEVEL_SPAWN_BONUS = 0.25;
+const WEAPON_STORAGE_CAPACITY = 5;
+const TEMPORARY_WEAPON_ID = 'temporaryA';
+const TEMPORARY_WEAPON_PICKUP_DISTANCE = 300;
 const PROJECTILE_INTERVAL = 1500;
 const PROJECTILE_DAMAGE = 1;
 const PROJECTILE_SPEED = 400;
@@ -71,9 +74,13 @@ type UpgradeChoice = {
   rarity: UpgradeRarity;
 };
 
+type StoredWeaponId = typeof TEMPORARY_WEAPON_ID;
+
 class GameScene extends Phaser.Scene {
   private player!: Phaser.GameObjects.Rectangle;
   private playerBody!: Phaser.Physics.Arcade.Body;
+  private weaponPickup!: Phaser.GameObjects.Rectangle;
+  private weaponPickupLabel!: Phaser.GameObjects.Text;
   private monsters!: Phaser.Physics.Arcade.Group;
   private projectiles!: Phaser.Physics.Arcade.Group;
   private radarGraphics!: Phaser.GameObjects.Graphics;
@@ -85,6 +92,8 @@ class GameScene extends Phaser.Scene {
   private playerLevel = PLAYER_START_LEVEL;
   private experienceFill!: Phaser.GameObjects.Rectangle;
   private experienceText!: Phaser.GameObjects.Text;
+  private storedWeapons: StoredWeaponId[] = [];
+  private weaponStorageText!: Phaser.GameObjects.Text;
   private projectileTimer!: Phaser.Time.TimerEvent;
   private monsterSpawnTimer!: Phaser.Time.TimerEvent;
   private attackSpeedMultiplier = 1;
@@ -110,6 +119,7 @@ class GameScene extends Phaser.Scene {
     this.experience = 0;
     this.experienceToNextLevel = PLAYER_START_XP_REQUIREMENT;
     this.playerLevel = PLAYER_START_LEVEL;
+    this.storedWeapons = [];
     this.attackSpeedMultiplier = 1;
     this.movementSpeedMultiplier = 1;
     this.radarRadius = RADAR_RADIUS;
@@ -226,6 +236,27 @@ class GameScene extends Phaser.Scene {
       PLAYER_COLOR,
     );
     this.player.setDepth(2);
+    this.weaponPickup = this.add.rectangle(
+      this.player.x + TEMPORARY_WEAPON_PICKUP_DISTANCE,
+      this.player.y,
+      24,
+      24,
+      0xf4b942,
+    );
+    this.weaponPickup.setRotation(Math.PI / 4).setDepth(2);
+    this.weaponPickup.setData('weaponId', TEMPORARY_WEAPON_ID);
+    this.weaponPickupLabel = this.add.text(
+      this.weaponPickup.x,
+      this.weaponPickup.y - 24,
+      '임시 아이템 A',
+      {
+        color: '#ffd166',
+        fontFamily: 'sans-serif',
+        fontSize: '14px',
+        backgroundColor: '#111827',
+        padding: { x: 4, y: 2 },
+      },
+    ).setOrigin(0.5).setDepth(3);
     this.keys = {
       up: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.W),
       down: keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.S),
@@ -236,10 +267,18 @@ class GameScene extends Phaser.Scene {
     this.physics.add.existing(this.player);
     this.playerBody = this.player.body as Phaser.Physics.Arcade.Body;
     this.playerBody.setCollideWorldBounds(true);
+    this.physics.add.existing(this.weaponPickup, true);
     this.physics.world.setBounds(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
     this.physics.add.collider(this.player, blocks);
     this.physics.add.collider(this.player, obstacleGroup);
     this.createPlayerHud();
+    this.physics.add.overlap(
+      this.player,
+      this.weaponPickup,
+      this.onWeaponPickup,
+      undefined,
+      this,
+    );
 
     this.monsters = this.physics.add.group();
     this.monsterTarget.set(this.player.x, this.player.y);
@@ -350,6 +389,16 @@ class GameScene extends Phaser.Scene {
       fontSize: '16px',
     });
     this.playerHealthText.setScrollFactor(0).setDepth(11);
+
+    this.weaponStorageText = this.add.text(20, 94, '', {
+      color: '#ffffff',
+      fontFamily: 'sans-serif',
+      fontSize: '16px',
+      lineSpacing: 4,
+    });
+    this.weaponStorageText.setScrollFactor(0).setDepth(11);
+    this.updateWeaponStorageHud();
+
     this.updateExperienceHud();
     this.updatePlayerHealthHud();
 
@@ -410,6 +459,44 @@ class GameScene extends Phaser.Scene {
         ? `LV ${this.playerLevel}  MAX`
         : `LV ${this.playerLevel}  EXP ${this.experience} / ${this.experienceToNextLevel}`,
     );
+  }
+
+  private updateWeaponStorageHud() {
+    const contents = this.storedWeapons.length > 0
+      ? this.storedWeapons.map(() => '임시 무기 A').join('\n')
+      : '비어 있음';
+    this.weaponStorageText.setText(
+      `무기 창고 ${this.storedWeapons.length}/${WEAPON_STORAGE_CAPACITY}\n${contents}`,
+    );
+  }
+
+  private onWeaponPickup(
+    _playerObject: Phaser.Types.Physics.Arcade.GameObjectWithBody
+      | Phaser.Physics.Arcade.Body
+      | Phaser.Physics.Arcade.StaticBody
+      | Phaser.Tilemaps.Tile,
+    pickupObject: Phaser.Types.Physics.Arcade.GameObjectWithBody
+      | Phaser.Physics.Arcade.Body
+      | Phaser.Physics.Arcade.StaticBody
+      | Phaser.Tilemaps.Tile,
+  ) {
+    if (
+      !(pickupObject instanceof Phaser.GameObjects.Rectangle)
+      || !pickupObject.active
+      || this.storedWeapons.length >= WEAPON_STORAGE_CAPACITY
+    ) {
+      return;
+    }
+
+    const weaponId: unknown = pickupObject.getData('weaponId');
+    if (weaponId !== TEMPORARY_WEAPON_ID) {
+      return;
+    }
+
+    this.storedWeapons.push(weaponId);
+    this.updateWeaponStorageHud();
+    pickupObject.destroy();
+    this.weaponPickupLabel.destroy();
   }
 
   private gainExperience(amount: number) {
