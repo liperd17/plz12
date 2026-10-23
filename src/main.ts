@@ -1,4 +1,22 @@
 import Phaser from 'phaser';
+import { PLAYER_INVULNERABILITY_DURATION, PlayerDamageState } from './playerDamage.ts';
+import {
+  applyDamageToHealth,
+  advanceProjectile,
+  createProjectileBurst,
+  createProjectileShot,
+  consumeProjectileOnHit,
+  findFirstProjectileHit,
+  getWeaponBonusDescription,
+  getWeaponDamage,
+  getWeaponEffectiveRange,
+  getWeaponProjectileCount,
+  isWithinAttackLine,
+  willUnlockWeaponBonusAtNextLevel,
+  WEAPON_IDS,
+  WEAPONS,
+  type WeaponId,
+} from './weapons.ts';
 import './style.css';
 
 const GAME_WIDTH = 1280;
@@ -11,16 +29,15 @@ const BLOCK_SIZE = PLAYER_SIZE * 4;
 const MONSTER_TEXTURE = 'enemy-bat';
 const MONSTER_SIZE = 32;
 const MONSTER_SPEED = 120;
+const MONSTER_MAX_HEALTH = 20;
 const MONSTER_START_COUNT = 3;
 const MONSTER_MAX_COUNT = 30;
 const MONSTER_SPAWN_INTERVAL = 5000;
 const MONSTER_TARGET_INTERVAL = 250;
 const MONSTER_PATH_UPDATE_INTERVAL = 500;
 const MONSTER_PLAYER_CLEARANCE = 500;
-const MONSTER_ATTACK_COOLDOWN = 3000;
 const MONSTER_ATTACK_DAMAGE = 5;
 const MONSTER_DEATH_FADE_DURATION = 300;
-const PLAYER_HIT_FLASH_DURATION = 1000;
 const PLAYER_COLOR = 0x4ade80;
 const PLAYER_HIT_COLOR = 0xff0000;
 const PLAYER_MAX_HEALTH = 100;
@@ -34,11 +51,7 @@ const MONSTER_LEVEL_SPAWN_BONUS = 0.25;
 const WEAPON_STORAGE_CAPACITY = 5;
 const TEMPORARY_WEAPON_ID = 'temporaryA';
 const TEMPORARY_WEAPON_PICKUP_DISTANCE = 300;
-const PROJECTILE_INTERVAL = 1500;
-const PROJECTILE_DAMAGE = 1;
-const PROJECTILE_SPEED = 400;
 const PROJECTILE_RADIUS = 5;
-const PROJECTILE_LIFETIME = 2000;
 const RADAR_RADIUS = 500;
 const OBSTACLE_MIN_COUNT = 20;
 const OBSTACLE_MAX_COUNT = 30;
@@ -66,15 +79,19 @@ type NavigationNode = {
   edges: NavigationEdge[];
 };
 
-type UpgradeKind = 'attackSpeed' | 'movementSpeed' | 'heal' | 'radar';
-type UpgradeRarity = 'common' | 'advanced';
-
 type UpgradeChoice = {
-  kind: UpgradeKind;
-  rarity: UpgradeRarity;
+  weaponId: WeaponId;
+  currentLevel: number;
+  currentDamage: number;
+  upgradedDamage: number;
+  currentRange: number;
+  upgradedRange: number;
+  currentProjectileCount: number;
+  upgradedProjectileCount: number;
+  unlocksBonus: boolean;
 };
 
-type StoredWeaponId = typeof TEMPORARY_WEAPON_ID;
+type StoredWeaponId = WeaponId | typeof TEMPORARY_WEAPON_ID;
 
 class GameScene extends Phaser.Scene {
   private player!: Phaser.GameObjects.Rectangle;
@@ -82,7 +99,7 @@ class GameScene extends Phaser.Scene {
   private weaponPickup!: Phaser.GameObjects.Rectangle;
   private weaponPickupLabel!: Phaser.GameObjects.Text;
   private monsters!: Phaser.Physics.Arcade.Group;
-  private projectiles!: Phaser.Physics.Arcade.Group;
+  private projectiles!: Phaser.GameObjects.Group;
   private radarGraphics!: Phaser.GameObjects.Graphics;
   private playerHealth = PLAYER_MAX_HEALTH;
   private playerHealthFill!: Phaser.GameObjects.Rectangle;
@@ -94,10 +111,13 @@ class GameScene extends Phaser.Scene {
   private experienceText!: Phaser.GameObjects.Text;
   private storedWeapons: StoredWeaponId[] = [];
   private weaponStorageText!: Phaser.GameObjects.Text;
-  private projectileTimer!: Phaser.Time.TimerEvent;
+  private weaponTimers = new Map<WeaponId, Phaser.Time.TimerEvent>();
   private monsterSpawnTimer!: Phaser.Time.TimerEvent;
-  private attackSpeedMultiplier = 1;
-  private movementSpeedMultiplier = 1;
+  private weaponLevels: Record<WeaponId, number> = {
+    basicAttack: 1,
+    rapidAttackA: 0,
+    slashAttack: 0,
+  };
   private radarRadius = RADAR_RADIUS;
   private gameOverOverlay!: Array<Phaser.GameObjects.Rectangle | Phaser.GameObjects.Text>;
   private obstaclePlacements: ObstaclePlacement[] = [];
@@ -106,7 +126,7 @@ class GameScene extends Phaser.Scene {
   private monsterTarget = new Phaser.Math.Vector2();
   private navigationGoal = new Phaser.Math.Vector2();
   private navigationDistances: number[] = [];
-  private monsterAttackCooldownActive = false;
+  private playerDamage = new PlayerDamageState();
   private isGameOver = false;
   private keys!: Record<'up' | 'down' | 'left' | 'right', Phaser.Input.Keyboard.Key>;
 
@@ -120,10 +140,14 @@ class GameScene extends Phaser.Scene {
     this.experienceToNextLevel = PLAYER_START_XP_REQUIREMENT;
     this.playerLevel = PLAYER_START_LEVEL;
     this.storedWeapons = [];
-    this.attackSpeedMultiplier = 1;
-    this.movementSpeedMultiplier = 1;
+    this.weaponTimers.clear();
+    this.weaponLevels = {
+      basicAttack: 1,
+      rapidAttackA: 0,
+      slashAttack: 0,
+    };
     this.radarRadius = RADAR_RADIUS;
-    this.monsterAttackCooldownActive = false;
+    this.playerDamage.reset();
     this.isGameOver = false;
     this.obstaclePlacements = [];
     this.navigationRects = [];
@@ -300,19 +324,8 @@ class GameScene extends Phaser.Scene {
       this,
     );
 
-    this.projectiles = this.physics.add.group();
-    this.physics.add.overlap(
-      this.projectiles,
-      this.monsters,
-      this.onProjectileHit,
-      undefined,
-      this,
-    );
-    this.projectileTimer = this.time.addEvent({
-      delay: this.getProjectileInterval(),
-      loop: true,
-      callback: () => this.fireProjectile(),
-    });
+    this.projectiles = this.add.group();
+    this.startWeaponTimer('basicAttack');
 
     this.time.addEvent({
       delay: MONSTER_TARGET_INTERVAL,
@@ -463,7 +476,11 @@ class GameScene extends Phaser.Scene {
 
   private updateWeaponStorageHud() {
     const contents = this.storedWeapons.length > 0
-      ? this.storedWeapons.map(() => '임시 무기 A').join('\n')
+      ? this.storedWeapons.map((weaponId) =>
+        weaponId === TEMPORARY_WEAPON_ID
+          ? '임시 무기 A'
+          : `${WEAPONS[weaponId].name} Lv.${this.weaponLevels[weaponId]}`,
+      ).join('\n')
       : '비어 있음';
     this.weaponStorageText.setText(
       `무기 창고 ${this.storedWeapons.length}/${WEAPON_STORAGE_CAPACITY}\n${contents}`,
@@ -526,10 +543,6 @@ class GameScene extends Phaser.Scene {
     }
   }
 
-  private getProjectileInterval() {
-    return PROJECTILE_INTERVAL / this.attackSpeedMultiplier;
-  }
-
   private getMonsterSpawnInterval() {
     const spawnRateMultiplier = (1 + MONSTER_LEVEL_SPAWN_BONUS)
       ** (this.playerLevel - PLAYER_START_LEVEL);
@@ -545,41 +558,46 @@ class GameScene extends Phaser.Scene {
   }
 
   private openUpgradeSelection() {
-    const kinds: UpgradeKind[] = ['attackSpeed', 'movementSpeed', 'heal', 'radar'];
-    const choices = Phaser.Utils.Array.Shuffle(kinds)
+    const availableWeapons = WEAPON_IDS.filter(
+      (weaponId) =>
+        this.weaponLevels[weaponId] > 0
+        || this.storedWeapons.length < WEAPON_STORAGE_CAPACITY,
+    );
+    const choices = Phaser.Utils.Array.Shuffle(availableWeapons)
       .slice(0, 3)
-      .map((kind): UpgradeChoice => ({
-        kind,
-        rarity: Phaser.Math.Between(1, 100) <= 20 ? 'advanced' : 'common',
-      }));
+      .map((weaponId): UpgradeChoice => {
+        const currentLevel = this.weaponLevels[weaponId];
+        return {
+          weaponId,
+          currentLevel,
+          currentDamage: getWeaponDamage(weaponId, Math.max(0, currentLevel - 1)),
+          upgradedDamage: getWeaponDamage(weaponId, currentLevel),
+          currentRange: getWeaponEffectiveRange(weaponId, currentLevel),
+          upgradedRange: getWeaponEffectiveRange(weaponId, currentLevel + 1),
+          currentProjectileCount: getWeaponProjectileCount(weaponId, currentLevel),
+          upgradedProjectileCount: getWeaponProjectileCount(weaponId, currentLevel + 1),
+          unlocksBonus: willUnlockWeaponBonusAtNextLevel(weaponId, currentLevel),
+        };
+      });
     this.scene.launch('upgrade', choices);
     this.scene.pause();
   }
 
   applyUpgrade(choice: UpgradeChoice) {
-    const advanced = choice.rarity === 'advanced';
-    switch (choice.kind) {
-      case 'attackSpeed':
-        this.attackSpeedMultiplier *= 1 + (advanced ? 0.1 : 0.05);
-        this.projectileTimer.reset({
-          delay: this.getProjectileInterval(),
-          loop: true,
-          callback: () => this.fireProjectile(),
-        });
-        break;
-      case 'movementSpeed':
-        this.movementSpeedMultiplier *= 1 + (advanced ? 0.08 : 0.03);
-        break;
-      case 'heal':
-        this.playerHealth = advanced
-          ? PLAYER_MAX_HEALTH
-          : Math.min(PLAYER_MAX_HEALTH, this.playerHealth + 20);
-        this.updatePlayerHealthHud();
-        break;
-      case 'radar':
-        this.radarRadius *= 1 + (advanced ? 0.1 : 0.05);
-        break;
+    const currentLevel = this.weaponLevels[choice.weaponId];
+    if (
+      currentLevel === 0
+      && this.storedWeapons.length >= WEAPON_STORAGE_CAPACITY
+    ) {
+      throw new Error('Unable to acquire a weapon because the weapon storage is full.');
     }
+
+    if (currentLevel === 0) {
+      this.storedWeapons.push(choice.weaponId);
+      this.startWeaponTimer(choice.weaponId);
+    }
+    this.weaponLevels[choice.weaponId] += 1;
+    this.updateWeaponStorageHud();
   }
 
   private spawnMonsterOnTimer() {
@@ -682,7 +700,7 @@ class GameScene extends Phaser.Scene {
       const monster = this.physics.add.sprite(x, y, MONSTER_TEXTURE);
       monster.setDisplaySize(MONSTER_SIZE, MONSTER_SIZE);
       monster.setDepth(2);
-      monster.setData('canAttack', !this.monsterAttackCooldownActive);
+      monster.setData('health', MONSTER_MAX_HEALTH);
       monster.setCollideWorldBounds(true);
       this.monsters.add(monster);
       this.updateMonsterWaypoint(monster);
@@ -945,34 +963,25 @@ class GameScene extends Phaser.Scene {
       !(monsterObject instanceof Phaser.Physics.Arcade.Sprite)
       || !monsterObject.active
       || monsterObject.getData('dead')
-      || !monsterObject.getData('canAttack')
-      || this.monsterAttackCooldownActive
       || this.isGameOver
     ) {
       return;
     }
 
-    this.monsterAttackCooldownActive = true;
-    this.playerHealth = Math.max(0, this.playerHealth - MONSTER_ATTACK_DAMAGE);
-    this.updatePlayerHealthHud();
-    this.player.setFillStyle(PLAYER_HIT_COLOR);
-    this.time.delayedCall(PLAYER_HIT_FLASH_DURATION, () => {
-      this.player.setFillStyle(PLAYER_COLOR);
-    });
-
-    for (const child of this.monsters.getChildren()) {
-      if (child instanceof Phaser.Physics.Arcade.Sprite) {
-        child.setData('canAttack', false);
-      }
+    const updatedHealth = this.playerDamage.tryApplyDamage(
+      this.playerHealth,
+      MONSTER_ATTACK_DAMAGE,
+      this.time.now,
+    );
+    if (updatedHealth === undefined) {
+      return;
     }
 
-    this.time.delayedCall(MONSTER_ATTACK_COOLDOWN, () => {
-      this.monsterAttackCooldownActive = false;
-      for (const child of this.monsters.getChildren()) {
-        if (child instanceof Phaser.Physics.Arcade.Sprite) {
-          child.setData('canAttack', true);
-        }
-      }
+    this.playerHealth = updatedHealth;
+    this.updatePlayerHealthHud();
+    this.player.setFillStyle(PLAYER_HIT_COLOR);
+    this.time.delayedCall(PLAYER_INVULNERABILITY_DURATION, () => {
+      this.player.setFillStyle(PLAYER_COLOR);
     });
 
     if (this.playerHealth === 0) {
@@ -980,80 +989,230 @@ class GameScene extends Phaser.Scene {
     }
   }
 
-  private fireProjectile() {
+  private startWeaponTimer(weaponId: WeaponId) {
+    if (this.weaponTimers.has(weaponId)) {
+      return;
+    }
+
+    this.weaponTimers.set(weaponId, this.time.addEvent({
+      delay: WEAPONS[weaponId].attackIntervalSeconds * 1000,
+      loop: true,
+      callback: () => this.fireWeapon(weaponId),
+    }));
+  }
+
+  private fireWeapon(weaponId: WeaponId) {
     if (this.isGameOver) {
       return;
     }
 
-    const target = this.getNearestRadarMonster();
+    const weapon = WEAPONS[weaponId];
+    const target = this.getNearestMonsterInRange(
+      Math.min(
+        getWeaponEffectiveRange(weaponId, this.weaponLevels[weaponId]),
+        this.radarRadius,
+      ),
+    );
     if (!target) {
       return;
     }
 
-    const projectile = this.add.circle(
-      this.player.x,
-      this.player.y,
-      PROJECTILE_RADIUS,
-      0xffed70,
-    );
-    projectile.setDepth(4);
-    this.physics.add.existing(projectile);
-    const body = projectile.body as Phaser.Physics.Arcade.Body;
-    body.setCircle(PROJECTILE_RADIUS);
+    if (weapon.attackMode === 'line') {
+      this.fireLineAttack(weaponId, target);
+      return;
+    }
+
+    const weaponLevel = this.weaponLevels[weaponId];
+    const burst = createProjectileBurst(weaponId, weaponLevel);
+    for (const shot of burst) {
+      const launchProjectile = () => {
+        if (this.isGameOver) {
+          return;
+        }
+
+        const launchTarget = this.getNearestMonsterInRange(
+          Math.min(getWeaponEffectiveRange(weaponId, weaponLevel), this.radarRadius),
+        );
+        if (!launchTarget) {
+          return;
+        }
+        const projectileShot = createProjectileShot(
+          weaponId,
+          this.player.x,
+          this.player.y,
+          launchTarget.x,
+          launchTarget.y,
+          weaponLevel,
+        );
+        if (!projectileShot) {
+          return;
+        }
+
+        const projectile = this.add.circle(
+          this.player.x,
+          this.player.y,
+          PROJECTILE_RADIUS,
+          projectileShot.hasPiercingAttribute ? 0x8bd3ff : 0xffed70,
+        );
+        projectile.setDepth(4);
+        projectile.setData('velocityX', projectileShot.velocityX);
+        projectile.setData('velocityY', projectileShot.velocityY);
+        projectile.setData('damage', projectileShot.damage);
+        projectile.setData('remainingRange', projectileShot.range);
+        this.projectiles.add(projectile);
+
+      };
+
+      if (shot.delayMs === 0) {
+        launchProjectile();
+      } else {
+        this.time.delayedCall(shot.delayMs, launchProjectile);
+      }
+    }
+  }
+
+  private fireLineAttack(
+    weaponId: WeaponId,
+    target: Phaser.Physics.Arcade.Sprite,
+  ) {
+    const weapon = WEAPONS[weaponId];
     const direction = new Phaser.Math.Vector2(
       target.x - this.player.x,
       target.y - this.player.y,
     ).normalize();
-    body.setVelocity(direction.x * PROJECTILE_SPEED, direction.y * PROJECTILE_SPEED);
-    projectile.setData('damage', PROJECTILE_DAMAGE);
-    projectile.setData('target', target);
-    this.projectiles.add(projectile);
+    const range = getWeaponEffectiveRange(weaponId, this.weaponLevels[weaponId]);
+    const endX = this.player.x + direction.x * range;
+    const endY = this.player.y + direction.y * range;
+    const slashEffect = this.add.graphics().setDepth(4);
+    slashEffect.lineStyle(4, 0xdbeafe, 0.9);
+    slashEffect.lineBetween(this.player.x, this.player.y, endX, endY);
+    this.time.delayedCall(120, () => slashEffect.destroy());
 
-    this.time.delayedCall(PROJECTILE_LIFETIME, () => {
-      if (projectile.active) {
-        projectile.destroy();
+    const damage = getWeaponDamage(weaponId, this.weaponLevels[weaponId] - 1);
+    for (const child of this.monsters.getChildren()) {
+      if (
+        !(child instanceof Phaser.Physics.Arcade.Sprite)
+        || !child.active
+        || child.getData('dead')
+        || !isWithinAttackLine(
+          this.player.x,
+          this.player.y,
+          endX,
+          endY,
+          child.x,
+          child.y,
+          weapon.attackWidthPx,
+        )
+      ) {
+        continue;
       }
-    });
+
+      this.damageMonster(child, damage);
+    }
   }
 
-  private onProjectileHit(
-    projectileObject: Phaser.Types.Physics.Arcade.GameObjectWithBody
-      | Phaser.Physics.Arcade.Body
-      | Phaser.Physics.Arcade.StaticBody
-      | Phaser.Tilemaps.Tile,
-    monsterObject: Phaser.Types.Physics.Arcade.GameObjectWithBody
-      | Phaser.Physics.Arcade.Body
-      | Phaser.Physics.Arcade.StaticBody
-      | Phaser.Tilemaps.Tile,
-  ) {
-    if (
-      !(projectileObject instanceof Phaser.GameObjects.Arc)
-      || !(monsterObject instanceof Phaser.Physics.Arcade.Sprite)
-      || !projectileObject.active
-      || !monsterObject.active
-      || monsterObject.getData('dead')
-    ) {
+  private updateProjectileMovement(delta: number) {
+    for (const child of this.projectiles.getChildren()) {
+      if (!(child instanceof Phaser.GameObjects.Arc) || !child.active) {
+        continue;
+      }
+
+      const velocityX: unknown = child.getData('velocityX');
+      const velocityY: unknown = child.getData('velocityY');
+      const remainingRange: unknown = child.getData('remainingRange');
+      const damage: unknown = child.getData('damage');
+      if (
+        typeof velocityX !== 'number'
+        || typeof velocityY !== 'number'
+        || typeof remainingRange !== 'number'
+        || !Number.isFinite(velocityX)
+        || !Number.isFinite(velocityY)
+        || !Number.isFinite(remainingRange)
+        || remainingRange < 0
+        || typeof damage !== 'number'
+        || !Number.isFinite(damage)
+        || damage <= 0
+      ) {
+        throw new Error('Projectile is missing valid movement or damage data.');
+      }
+
+      const step = advanceProjectile(
+        child.x,
+        child.y,
+        velocityX,
+        velocityY,
+        delta,
+        remainingRange,
+      );
+      const liveMonsters = this.monsters.getChildren().filter(
+        (monster): monster is Phaser.Physics.Arcade.Sprite =>
+          monster instanceof Phaser.Physics.Arcade.Sprite
+          && monster.active
+          && !monster.getData('dead'),
+      );
+      const targets = liveMonsters.map((monster) => ({
+        x: monster.x,
+        y: monster.y,
+        width: MONSTER_SIZE,
+        height: MONSTER_SIZE,
+      }));
+      const hitIndex = findFirstProjectileHit(
+        step.startX,
+        step.startY,
+        step.endX,
+        step.endY,
+        targets,
+        PROJECTILE_RADIUS,
+      );
+      if (hitIndex !== undefined) {
+        if (!consumeProjectileOnHit(child)) {
+          continue;
+        }
+        child.destroy();
+        this.damageMonster(liveMonsters[hitIndex], damage);
+        continue;
+      }
+
+      child.setPosition(step.endX, step.endY);
+      child.setData('remainingRange', step.remainingRange);
+      if (step.expired) {
+        child.destroy();
+      }
+    }
+  }
+
+  private damageMonster(monster: Phaser.Physics.Arcade.Sprite, damage: number) {
+    const health: unknown = monster.getData('health');
+    if (typeof health !== 'number' || !Number.isFinite(health)) {
+      throw new Error('Monster is missing a valid health value.');
+    }
+
+    const remainingHealth = applyDamageToHealth(health, damage);
+    monster.setData('health', remainingHealth);
+    if (remainingHealth > 0) {
       return;
     }
 
-    projectileObject.destroy();
-    monsterObject.setData('dead', true);
+    monster.setData('dead', true);
     this.gainExperience(1);
-    monsterObject.setData('canAttack', false);
-    const body = monsterObject.body as Phaser.Physics.Arcade.Body;
+    const body = monster.body as Phaser.Physics.Arcade.Body;
     body.setVelocity(0, 0);
     body.enable = false;
     this.tweens.add({
-      targets: monsterObject,
+      targets: monster,
       alpha: 0,
       duration: MONSTER_DEATH_FADE_DURATION,
-      onComplete: () => monsterObject.destroy(),
+      onComplete: () => monster.destroy(),
     });
   }
 
   private getNearestRadarMonster() {
+    return this.getNearestMonsterInRange(this.radarRadius);
+  }
+
+  private getNearestMonsterInRange(range: number) {
     let closestMonster: Phaser.Physics.Arcade.Sprite | undefined;
-    let closestDistance = this.radarRadius * this.radarRadius;
+    let closestDistance = range * range;
     for (const child of this.monsters.getChildren()) {
       if (
         !(child instanceof Phaser.Physics.Arcade.Sprite)
@@ -1077,7 +1236,7 @@ class GameScene extends Phaser.Scene {
     return closestMonster;
   }
 
-  update() {
+  update(_time: number, delta: number) {
     if (this.isGameOver) {
       return;
     }
@@ -1091,39 +1250,14 @@ class GameScene extends Phaser.Scene {
     } else {
       direction.normalize();
       this.playerBody.setVelocity(
-        direction.x * PLAYER_SPEED * this.movementSpeedMultiplier,
-        direction.y * PLAYER_SPEED * this.movementSpeedMultiplier,
+        direction.x * PLAYER_SPEED,
+        direction.y * PLAYER_SPEED,
       );
     }
 
     this.updateMonsterMovement();
-    this.updateProjectileHoming();
+    this.updateProjectileMovement(delta);
     this.updateRadar();
-  }
-
-  private updateProjectileHoming() {
-    for (const child of this.projectiles.getChildren()) {
-      if (!(child instanceof Phaser.GameObjects.Arc) || !child.active) {
-        continue;
-      }
-
-      const target: unknown = child.getData('target');
-      if (
-        !(target instanceof Phaser.Physics.Arcade.Sprite)
-        || !target.active
-        || target.getData('dead')
-      ) {
-        child.destroy();
-        continue;
-      }
-
-      const direction = new Phaser.Math.Vector2(target.x - child.x, target.y - child.y);
-      if (direction.lengthSq() > 0) {
-        direction.normalize();
-        const body = child.body as Phaser.Physics.Arcade.Body;
-        body.setVelocity(direction.x * PROJECTILE_SPEED, direction.y * PROJECTILE_SPEED);
-      }
-    }
   }
 
   private updateMonsterMovement() {
@@ -1182,7 +1316,7 @@ class UpgradeScene extends Phaser.Scene {
       fontSize: '42px',
       fontStyle: 'bold',
     }).setOrigin(0.5).setScrollFactor(0);
-    this.add.text(GAME_WIDTH / 2, 176, 'Choose an upgrade', {
+    this.add.text(GAME_WIDTH / 2, 176, 'Choose a weapon', {
       color: '#cbd5e1',
       fontFamily: 'sans-serif',
       fontSize: '20px',
@@ -1193,49 +1327,60 @@ class UpgradeScene extends Phaser.Scene {
     const cardY = GAME_HEIGHT / 2 + 25;
     const cardCenters = [210, GAME_WIDTH / 2, GAME_WIDTH - 210];
     for (const [index, choice] of choices.entries()) {
-      const advanced = choice.rarity === 'advanced';
-      const titleColor = advanced ? '#ffd166' : '#8bd3ff';
-      const descriptions: Record<UpgradeKind, [string, string]> = {
-        attackSpeed: [
-          'Attack Speed',
-          `Projectile firing rate +${advanced ? 10 : 5}%`,
-        ],
-        movementSpeed: [
-          'Movement Speed',
-          `Movement speed +${advanced ? 8 : 3}%`,
-        ],
-        heal: [
-          'Recover Health',
-          advanced ? 'Restore all health' : 'Restore 20 health',
-        ],
-        radar: [
-          'Radar Range',
-          `Radar range +${advanced ? 10 : 5}%`,
-        ],
-      };
-      const [title, description] = descriptions[choice.kind];
+      const weapon = WEAPONS[choice.weaponId];
+      const isNewWeapon = choice.currentLevel === 0;
+      const titleColor = choice.unlocksBonus
+        ? '#ffe08a'
+        : isNewWeapon
+          ? '#8bd3ff'
+          : '#ffd166';
+      const status = choice.unlocksBonus
+        ? 'LEVEL 5 BONUS!'
+        : isNewWeapon
+          ? 'NEW WEAPON'
+          : `WEAPON LV ${choice.currentLevel} → ${choice.currentLevel + 1}`;
+      const description = [
+        isNewWeapon
+          ? `Damage ${choice.upgradedDamage}`
+          : `Damage ${choice.currentDamage} → ${choice.upgradedDamage}`,
+        `Interval ${weapon.attackIntervalSeconds}s`,
+        choice.currentRange === choice.upgradedRange
+          ? `Range ${choice.upgradedRange}px`
+          : `Range ${choice.currentRange} → ${choice.upgradedRange}px`,
+        choice.currentProjectileCount === choice.upgradedProjectileCount
+          ? `Projectiles ${choice.upgradedProjectileCount}`
+          : `Projectiles ${choice.currentProjectileCount} → ${choice.upgradedProjectileCount}`,
+        ...(choice.unlocksBonus
+          ? [getWeaponBonusDescription(choice.weaponId) ?? 'Level 5 bonus unlocked']
+          : []),
+      ].join('\n');
+      const cardColor = choice.unlocksBonus ? 0x3a3320 : 0x1e293b;
+      const cardHoverColor = choice.unlocksBonus ? 0x514522 : 0x293b52;
       const card = this.add.rectangle(
         cardCenters[index],
         cardY,
         cardWidth,
         cardHeight,
-        0x1e293b,
+        cardColor,
         0.98,
       );
-      card.setStrokeStyle(3, advanced ? 0xf4b942 : 0x38a9ff);
+      card.setStrokeStyle(
+        choice.unlocksBonus ? 5 : 3,
+        choice.unlocksBonus || !isNewWeapon ? 0xf4b942 : 0x38a9ff,
+      );
       card.setScrollFactor(0);
       card.setInteractive({ useHandCursor: true });
-      card.on('pointerover', () => card.setFillStyle(0x293b52, 1));
-      card.on('pointerout', () => card.setFillStyle(0x1e293b, 0.98));
+      card.on('pointerover', () => card.setFillStyle(cardHoverColor, 1));
+      card.on('pointerout', () => card.setFillStyle(cardColor, 0.98));
       card.on('pointerdown', () => this.chooseUpgrade(choice));
 
-      this.add.text(cardCenters[index], cardY - 86, advanced ? 'ADVANCED' : 'COMMON', {
+      this.add.text(cardCenters[index], cardY - 86, status, {
         color: titleColor,
         fontFamily: 'sans-serif',
         fontSize: '18px',
         fontStyle: 'bold',
       }).setOrigin(0.5).setScrollFactor(0);
-      this.add.text(cardCenters[index], cardY - 28, title, {
+      this.add.text(cardCenters[index], cardY - 28, weapon.name, {
         color: '#ffffff',
         fontFamily: 'sans-serif',
         fontSize: '24px',
