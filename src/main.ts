@@ -1,4 +1,11 @@
 import Phaser from 'phaser';
+import { CHARACTERS, getCharacterEffectiveRange, type CharacterId } from './characters.ts';
+import {
+  getMonsterIdForSpawnRoll,
+  isMonsterId,
+  MONSTER_IDS,
+  MONSTERS,
+} from './monsters.ts';
 import { PLAYER_INVULNERABILITY_DURATION, PlayerDamageState } from './playerDamage.ts';
 import {
   applyDamageToHealth,
@@ -26,10 +33,7 @@ const WORLD_HEIGHT = 3000;
 const GRID_SPACING = 100;
 const PLAYER_SIZE = 48;
 const BLOCK_SIZE = PLAYER_SIZE * 4;
-const MONSTER_TEXTURE = 'enemy-bat';
-const MONSTER_SIZE = 32;
-const MONSTER_SPEED = 120;
-const MONSTER_MAX_HEALTH = 20;
+const MAX_MONSTER_SIZE = Math.max(...Object.values(MONSTERS).map(({ size }) => size));
 const MONSTER_START_COUNT = 3;
 const MONSTER_MAX_COUNT = 30;
 const MONSTER_SPAWN_INTERVAL = 5000;
@@ -38,8 +42,8 @@ const MONSTER_PATH_UPDATE_INTERVAL = 500;
 const MONSTER_PLAYER_CLEARANCE = 500;
 const MONSTER_ATTACK_DAMAGE = 5;
 const MONSTER_DEATH_FADE_DURATION = 300;
-const PLAYER_COLOR = 0x4ade80;
 const PLAYER_HIT_COLOR = 0xff0000;
+const RED_PLAYER_HIT_COLOR = 0xff9aaa;
 const PLAYER_MAX_HEALTH = 100;
 const PLAYER_HEALTH_BAR_WIDTH = 220;
 const PLAYER_HEALTH_BAR_HEIGHT = 16;
@@ -93,7 +97,194 @@ type UpgradeChoice = {
 
 type StoredWeaponId = WeaponId | typeof TEMPORARY_WEAPON_ID;
 
+function addMenuButton(
+  scene: Phaser.Scene,
+  label: string,
+  x: number,
+  y: number,
+  onClick: () => void,
+) {
+  const background = scene.add.rectangle(x, y, 260, 56, 0x2563eb)
+    .setStrokeStyle(2, 0x93c5fd)
+    .setInteractive({ useHandCursor: true });
+  const text = scene.add.text(x, y, label, {
+    color: '#ffffff',
+    fontFamily: 'sans-serif',
+    fontSize: '22px',
+    fontStyle: 'bold',
+  }).setOrigin(0.5);
+
+  background.on('pointerover', () => background.setFillStyle(0x3b82f6));
+  background.on('pointerout', () => background.setFillStyle(0x2563eb));
+  background.on('pointerdown', onClick);
+  text.setInteractive({ useHandCursor: true }).on('pointerdown', onClick);
+}
+
+class TitleScene extends Phaser.Scene {
+  private startKey!: Phaser.Input.Keyboard.Key;
+
+  constructor() {
+    super('title');
+  }
+
+  create() {
+    const keyboard = this.input.keyboard;
+    if (!keyboard) {
+      throw new Error('Keyboard input is unavailable.');
+    }
+
+    this.add.rectangle(0, 0, GAME_WIDTH, GAME_HEIGHT, 0x111827).setOrigin(0);
+    this.add.text(GAME_WIDTH / 2, 240, 'SURVIVOR', {
+      color: '#4ade80',
+      fontFamily: 'sans-serif',
+      fontSize: '64px',
+      fontStyle: 'bold',
+    }).setOrigin(0.5);
+    this.add.text(GAME_WIDTH / 2, 310, '끝없이 몰려오는 적을 물리치세요', {
+      color: '#cbd5e1',
+      fontFamily: 'sans-serif',
+      fontSize: '22px',
+    }).setOrigin(0.5);
+    addMenuButton(this, '게임 시작', GAME_WIDTH / 2, 420, () => {
+      this.scene.start('character-select');
+    });
+    this.add.text(GAME_WIDTH / 2, 500, 'WASD 이동 · 자동 공격', {
+      color: '#94a3b8',
+      fontFamily: 'sans-serif',
+      fontSize: '18px',
+    }).setOrigin(0.5);
+
+    this.startKey = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.ENTER);
+  }
+
+  update() {
+    if (Phaser.Input.Keyboard.JustDown(this.startKey)) {
+      this.scene.start('character-select');
+    }
+  }
+}
+
+class CharacterSelectScene extends Phaser.Scene {
+  private startKey!: Phaser.Input.Keyboard.Key;
+  private backKey!: Phaser.Input.Keyboard.Key;
+  private leftKey!: Phaser.Input.Keyboard.Key;
+  private rightKey!: Phaser.Input.Keyboard.Key;
+  private characterCards!: Record<CharacterId, Phaser.GameObjects.Rectangle>;
+  private selectedCharacterId: CharacterId = 'green';
+
+  constructor() {
+    super('character-select');
+  }
+
+  create() {
+    const keyboard = this.input.keyboard;
+    if (!keyboard) {
+      throw new Error('Keyboard input is unavailable.');
+    }
+
+    this.selectedCharacterId = 'green';
+    this.add.rectangle(0, 0, GAME_WIDTH, GAME_HEIGHT, 0x111827).setOrigin(0);
+    this.add.text(GAME_WIDTH / 2, 115, '캐릭터 선택', {
+      color: '#ffffff',
+      fontFamily: 'sans-serif',
+      fontSize: '42px',
+      fontStyle: 'bold',
+    }).setOrigin(0.5);
+    this.add.text(GAME_WIDTH / 2, 170, '플레이할 캐릭터를 선택하세요', {
+      color: '#cbd5e1',
+      fontFamily: 'sans-serif',
+      fontSize: '20px',
+    }).setOrigin(0.5);
+
+    const cardCenters: Record<CharacterId, number> = {
+      green: 430,
+      red: 850,
+    };
+    this.characterCards = {
+      green: this.createCharacterCard('green', cardCenters.green),
+      red: this.createCharacterCard('red', cardCenters.red),
+    };
+    addMenuButton(this, '선택하고 시작', GAME_WIDTH / 2, 555, () => {
+      this.startGame();
+    });
+    addMenuButton(this, '뒤로', 110, 60, () => {
+      this.scene.start('title');
+    });
+
+    this.startKey = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.ENTER);
+    this.backKey = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.ESC);
+    this.leftKey = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.LEFT);
+    this.rightKey = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.RIGHT);
+  }
+
+  update() {
+    if (Phaser.Input.Keyboard.JustDown(this.startKey)) {
+      this.startGame();
+    }
+    if (Phaser.Input.Keyboard.JustDown(this.backKey)) {
+      this.scene.start('title');
+    }
+    if (Phaser.Input.Keyboard.JustDown(this.leftKey)) {
+      this.setSelected('green');
+    }
+    if (Phaser.Input.Keyboard.JustDown(this.rightKey)) {
+      this.setSelected('red');
+    }
+  }
+
+  private createCharacterCard(characterId: CharacterId, x: number) {
+    const definition = CHARACTERS[characterId];
+    const card = this.add.rectangle(x, 360, 360, 280, 0x1e293b)
+      .setInteractive({ useHandCursor: true });
+    card.on('pointerdown', () => this.setSelected(characterId));
+    this.add.rectangle(x, 290, 56, 56, definition.color);
+    this.add.text(x, 345, definition.name, {
+      color: '#ffffff',
+      fontFamily: 'sans-serif',
+      fontSize: '25px',
+      fontStyle: 'bold',
+    }).setOrigin(0.5);
+
+    const description = characterId === 'green'
+      ? '균형 잡힌 기본 캐릭터\n이동 속도: 기본 · 공격 사거리: 기본'
+      : '빠르게 움직이는 대신 사거리가 짧음\n이동 속도: +30% · 공격 사거리: 50%';
+    this.add.text(x, 410, description, {
+      color: '#cbd5e1',
+      fontFamily: 'sans-serif',
+      fontSize: '17px',
+      align: 'center',
+      lineSpacing: 8,
+    }).setOrigin(0.5);
+    this.add.text(x, 480, 'WASD 이동 · 기본 공격 자동', {
+      color: '#94a3b8',
+      fontFamily: 'sans-serif',
+      fontSize: '15px',
+    }).setOrigin(0.5);
+    this.updateCharacterCardStroke(characterId, card);
+    return card;
+  }
+
+  private setSelected(characterId: CharacterId) {
+    this.selectedCharacterId = characterId;
+    for (const [id, card] of Object.entries(this.characterCards) as [CharacterId, Phaser.GameObjects.Rectangle][]) {
+      this.updateCharacterCardStroke(id, card);
+    }
+  }
+
+  private updateCharacterCardStroke(characterId: CharacterId, card: Phaser.GameObjects.Rectangle) {
+    card.setStrokeStyle(
+      3,
+      characterId === this.selectedCharacterId ? CHARACTERS[characterId].color : 0x475569,
+    );
+  }
+
+  private startGame() {
+    this.scene.start('game', { characterId: this.selectedCharacterId });
+  }
+}
+
 class GameScene extends Phaser.Scene {
+  private characterId: CharacterId = 'green';
   private player!: Phaser.GameObjects.Rectangle;
   private playerBody!: Phaser.Physics.Arcade.Body;
   private weaponPickup!: Phaser.GameObjects.Rectangle;
@@ -134,7 +325,8 @@ class GameScene extends Phaser.Scene {
     super('game');
   }
 
-  create() {
+  create(data?: { characterId?: CharacterId }) {
+    this.characterId = data?.characterId === 'red' ? 'red' : 'green';
     this.playerHealth = PLAYER_MAX_HEALTH;
     this.experience = 0;
     this.experienceToNextLevel = PLAYER_START_XP_REQUIREMENT;
@@ -159,7 +351,7 @@ class GameScene extends Phaser.Scene {
       throw new Error('Keyboard input is unavailable.');
     }
 
-    this.createMonsterTexture();
+    this.createMonsterTextures();
 
     const grid = this.add.graphics();
     grid.lineStyle(1, 0x263244, 0.7);
@@ -257,7 +449,7 @@ class GameScene extends Phaser.Scene {
       WORLD_HEIGHT / 2,
       PLAYER_SIZE,
       PLAYER_SIZE,
-      PLAYER_COLOR,
+      CHARACTERS[this.characterId].color,
     );
     this.player.setDepth(2);
     this.weaponPickup = this.add.rectangle(
@@ -572,8 +764,8 @@ class GameScene extends Phaser.Scene {
           currentLevel,
           currentDamage: getWeaponDamage(weaponId, Math.max(0, currentLevel - 1)),
           upgradedDamage: getWeaponDamage(weaponId, currentLevel),
-          currentRange: getWeaponEffectiveRange(weaponId, currentLevel),
-          upgradedRange: getWeaponEffectiveRange(weaponId, currentLevel + 1),
+          currentRange: this.getCharacterWeaponRange(weaponId, currentLevel),
+          upgradedRange: this.getCharacterWeaponRange(weaponId, currentLevel + 1),
           currentProjectileCount: getWeaponProjectileCount(weaponId, currentLevel),
           upgradedProjectileCount: getWeaponProjectileCount(weaponId, currentLevel + 1),
           unlocksBonus: willUnlockWeaponBonusAtNextLevel(weaponId, currentLevel),
@@ -615,7 +807,7 @@ class GameScene extends Phaser.Scene {
 
   private restartAfterGameOver() {
     if (this.isGameOver) {
-      this.scene.restart();
+      this.scene.restart({ characterId: this.characterId });
     }
   }
 
@@ -642,18 +834,21 @@ class GameScene extends Phaser.Scene {
     }
   }
 
-  private createMonsterTexture() {
-    if (this.textures.exists(MONSTER_TEXTURE)) {
-      return;
-    }
+  private createMonsterTextures() {
+    for (const monsterId of MONSTER_IDS) {
+      const definition = MONSTERS[monsterId];
+      if (this.textures.exists(definition.texture)) {
+        continue;
+      }
 
-    const graphics = this.make.graphics({ x: 0, y: 0 }, false);
-    graphics.fillStyle(0xb44762, 1);
-    graphics.fillTriangle(16, 3, 1, 14, 8, 27);
-    graphics.fillTriangle(16, 3, 31, 14, 24, 27);
-    graphics.fillTriangle(16, 7, 10, 30, 22, 30);
-    graphics.generateTexture(MONSTER_TEXTURE, MONSTER_SIZE, MONSTER_SIZE);
-    graphics.destroy();
+      const graphics = this.make.graphics({ x: 0, y: 0 }, false);
+      graphics.fillStyle(definition.color, 1);
+      graphics.fillTriangle(16, 3, 1, 14, 8, 27);
+      graphics.fillTriangle(16, 3, 31, 14, 24, 27);
+      graphics.fillTriangle(16, 7, 10, 30, 22, 30);
+      graphics.generateTexture(definition.texture, 32, 32);
+      graphics.destroy();
+    }
   }
 
   private spawnMonster() {
@@ -661,7 +856,9 @@ class GameScene extends Phaser.Scene {
       return false;
     }
 
-    const halfSize = MONSTER_SIZE / 2;
+    const monsterId = getMonsterIdForSpawnRoll(Phaser.Math.Between(1, 10));
+    const definition = MONSTERS[monsterId];
+    const halfSize = definition.size / 2;
     const minimumPosition = BLOCK_SIZE + halfSize;
     const maximumX = WORLD_WIDTH - minimumPosition;
     const maximumY = WORLD_HEIGHT - minimumPosition;
@@ -671,7 +868,7 @@ class GameScene extends Phaser.Scene {
       const y = Phaser.Math.FloatBetween(minimumPosition, maximumY);
       if (
         Phaser.Math.Distance.Between(x, y, this.player.x, this.player.y)
-          < Math.max(MONSTER_PLAYER_CLEARANCE, (MONSTER_SIZE + PLAYER_SIZE) / 2)
+          < Math.max(MONSTER_PLAYER_CLEARANCE, (definition.size + PLAYER_SIZE) / 2)
       ) {
         continue;
       }
@@ -690,17 +887,19 @@ class GameScene extends Phaser.Scene {
           return false;
         }
 
-        return Math.abs(x - child.x) < MONSTER_SIZE
-          && Math.abs(y - child.y) < MONSTER_SIZE;
+        const otherSize = this.getMonsterSize(child);
+        return Math.abs(x - child.x) < (definition.size + otherSize) / 2
+          && Math.abs(y - child.y) < (definition.size + otherSize) / 2;
       });
       if (overlapsMonster) {
         continue;
       }
 
-      const monster = this.physics.add.sprite(x, y, MONSTER_TEXTURE);
-      monster.setDisplaySize(MONSTER_SIZE, MONSTER_SIZE);
+      const monster = this.physics.add.sprite(x, y, definition.texture);
+      monster.setDisplaySize(definition.size, definition.size);
       monster.setDepth(2);
-      monster.setData('health', MONSTER_MAX_HEALTH);
+      monster.setData('monsterId', monsterId);
+      monster.setData('health', definition.health);
       monster.setCollideWorldBounds(true);
       this.monsters.add(monster);
       this.updateMonsterWaypoint(monster);
@@ -711,7 +910,7 @@ class GameScene extends Phaser.Scene {
   }
 
   private createNavigationGraph() {
-    const clearance = MONSTER_SIZE / 2 + 1;
+    const clearance = MAX_MONSTER_SIZE / 2 + 1;
     this.navigationRects = this.obstaclePlacements.map(
       ({ x, y, width, height }) =>
         new Phaser.Geom.Rectangle(
@@ -722,7 +921,7 @@ class GameScene extends Phaser.Scene {
         ),
     );
 
-    const worldInset = BLOCK_SIZE + MONSTER_SIZE / 2;
+    const worldInset = BLOCK_SIZE + MAX_MONSTER_SIZE / 2;
     for (const rect of this.navigationRects) {
       const candidates = [
         { x: rect.left - 1, y: rect.top - 1 },
@@ -818,7 +1017,7 @@ class GameScene extends Phaser.Scene {
   }
 
   private getPathPoint(x: number, y: number) {
-    const worldInset = BLOCK_SIZE + MONSTER_SIZE / 2;
+    const worldInset = BLOCK_SIZE + MAX_MONSTER_SIZE / 2;
     const point = new Phaser.Math.Vector2(
       Phaser.Math.Clamp(x, worldInset, WORLD_WIDTH - worldInset),
       Phaser.Math.Clamp(y, worldInset, WORLD_HEIGHT - worldInset),
@@ -979,9 +1178,11 @@ class GameScene extends Phaser.Scene {
 
     this.playerHealth = updatedHealth;
     this.updatePlayerHealthHud();
-    this.player.setFillStyle(PLAYER_HIT_COLOR);
+    this.player.setFillStyle(
+      this.characterId === 'red' ? RED_PLAYER_HIT_COLOR : PLAYER_HIT_COLOR,
+    );
     this.time.delayedCall(PLAYER_INVULNERABILITY_DURATION, () => {
-      this.player.setFillStyle(PLAYER_COLOR);
+      this.player.setFillStyle(CHARACTERS[this.characterId].color);
     });
 
     if (this.playerHealth === 0) {
@@ -1009,7 +1210,7 @@ class GameScene extends Phaser.Scene {
     const weapon = WEAPONS[weaponId];
     const target = this.getNearestMonsterInRange(
       Math.min(
-        getWeaponEffectiveRange(weaponId, this.weaponLevels[weaponId]),
+        this.getCharacterWeaponRange(weaponId, this.weaponLevels[weaponId]),
         this.radarRadius,
       ),
     );
@@ -1031,7 +1232,7 @@ class GameScene extends Phaser.Scene {
         }
 
         const launchTarget = this.getNearestMonsterInRange(
-          Math.min(getWeaponEffectiveRange(weaponId, weaponLevel), this.radarRadius),
+          Math.min(this.getCharacterWeaponRange(weaponId, weaponLevel), this.radarRadius),
         );
         if (!launchTarget) {
           return;
@@ -1043,6 +1244,7 @@ class GameScene extends Phaser.Scene {
           launchTarget.x,
           launchTarget.y,
           weaponLevel,
+          CHARACTERS[this.characterId].effectiveRangeMultiplier,
         );
         if (!projectileShot) {
           return;
@@ -1080,7 +1282,7 @@ class GameScene extends Phaser.Scene {
       target.x - this.player.x,
       target.y - this.player.y,
     ).normalize();
-    const range = getWeaponEffectiveRange(weaponId, this.weaponLevels[weaponId]);
+    const range = this.getCharacterWeaponRange(weaponId, this.weaponLevels[weaponId]);
     const endX = this.player.x + direction.x * range;
     const endY = this.player.y + direction.y * range;
     const slashEffect = this.add.graphics().setDepth(4);
@@ -1153,8 +1355,8 @@ class GameScene extends Phaser.Scene {
       const targets = liveMonsters.map((monster) => ({
         x: monster.x,
         y: monster.y,
-        width: MONSTER_SIZE,
-        height: MONSTER_SIZE,
+        width: this.getMonsterSize(monster),
+        height: this.getMonsterSize(monster),
       }));
       const hitIndex = findFirstProjectileHit(
         step.startX,
@@ -1206,6 +1408,14 @@ class GameScene extends Phaser.Scene {
     });
   }
 
+  private getMonsterSize(monster: Phaser.Physics.Arcade.Sprite) {
+    const monsterId: unknown = monster.getData('monsterId');
+    if (!isMonsterId(monsterId)) {
+      throw new Error('Monster is missing a valid type.');
+    }
+    return MONSTERS[monsterId].size;
+  }
+
   private getNearestRadarMonster() {
     return this.getNearestMonsterInRange(this.radarRadius);
   }
@@ -1250,8 +1460,8 @@ class GameScene extends Phaser.Scene {
     } else {
       direction.normalize();
       this.playerBody.setVelocity(
-        direction.x * PLAYER_SPEED,
-        direction.y * PLAYER_SPEED,
+        direction.x * PLAYER_SPEED * CHARACTERS[this.characterId].movementSpeedMultiplier,
+        direction.y * PLAYER_SPEED * CHARACTERS[this.characterId].movementSpeedMultiplier,
       );
     }
 
@@ -1277,11 +1487,23 @@ class GameScene extends Phaser.Scene {
       }
 
       direction.normalize();
+      const monsterId: unknown = child.getData('monsterId');
+      if (!isMonsterId(monsterId)) {
+        throw new Error('Monster is missing a valid type.');
+      }
+      const speed = MONSTERS[monsterId].speed;
       child.setVelocity(
-        direction.x * MONSTER_SPEED,
-        direction.y * MONSTER_SPEED,
+        direction.x * speed,
+        direction.y * speed,
       );
     }
+  }
+
+  private getCharacterWeaponRange(weaponId: WeaponId, weaponLevel: number) {
+    return getCharacterEffectiveRange(
+      getWeaponEffectiveRange(weaponId, weaponLevel),
+      this.characterId,
+    );
   }
 
   private updateRadar() {
@@ -1430,7 +1652,7 @@ const config: Phaser.Types.Core.GameConfig = {
       debug: false,
     },
   },
-  scene: [GameScene, UpgradeScene],
+  scene: [TitleScene, CharacterSelectScene, GameScene, UpgradeScene],
 };
 
 new Phaser.Game(config);

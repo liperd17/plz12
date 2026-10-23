@@ -206,6 +206,7 @@ export function createProjectileShot(
   targetX: number,
   targetY: number,
   weaponLevel: number,
+  rangeMultiplier = 1,
 ): WeaponProjectile | undefined {
   const weapon = WEAPONS[weaponId];
   if (weapon.attackMode !== 'projectile') {
@@ -215,7 +216,7 @@ export function createProjectileShot(
   const directionX = targetX - playerX;
   const directionY = targetY - playerY;
   const distance = Math.hypot(directionX, directionY);
-  const effectiveRange = getWeaponEffectiveRange(weaponId, weaponLevel);
+  const effectiveRange = getWeaponEffectiveRange(weaponId, weaponLevel) * rangeMultiplier;
   if (distance === 0 || distance > effectiveRange) {
     return undefined;
   }
