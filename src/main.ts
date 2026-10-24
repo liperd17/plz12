@@ -2,9 +2,13 @@ import Phaser from 'phaser';
 import { CHARACTERS, getCharacterEffectiveRange, type CharacterId } from './characters.ts';
 import {
   getMonsterIdForSpawnRoll,
+  getSelfDestructWarningState,
   isMonsterId,
+  isWithinSelfDestructRadius,
   MONSTER_IDS,
   MONSTERS,
+  resolveSelfDestruct,
+  SELF_DESTRUCT_RADIUS,
 } from './monsters.ts';
 import { PLAYER_INVULNERABILITY_DURATION, PlayerDamageState } from './playerDamage.ts';
 import {
@@ -292,6 +296,7 @@ class GameScene extends Phaser.Scene {
   private monsters!: Phaser.Physics.Arcade.Group;
   private projectiles!: Phaser.GameObjects.Group;
   private radarGraphics!: Phaser.GameObjects.Graphics;
+  private selfDestructWarningGraphics!: Phaser.GameObjects.Graphics;
   private playerHealth = PLAYER_MAX_HEALTH;
   private playerHealthFill!: Phaser.GameObjects.Rectangle;
   private playerHealthText!: Phaser.GameObjects.Text;
@@ -536,6 +541,7 @@ class GameScene extends Phaser.Scene {
     });
 
     this.radarGraphics = this.add.graphics().setDepth(3);
+    this.selfDestructWarningGraphics = this.add.graphics().setDepth(3);
     keyboard.on('keydown-SPACE', this.restartAfterGameOver, this);
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
       keyboard.off('keydown-SPACE', this.restartAfterGameOver, this);
@@ -1167,9 +1173,13 @@ class GameScene extends Phaser.Scene {
       return;
     }
 
+    this.damagePlayer(MONSTER_ATTACK_DAMAGE);
+  }
+
+  private damagePlayer(damage: number) {
     const updatedHealth = this.playerDamage.tryApplyDamage(
       this.playerHealth,
-      MONSTER_ATTACK_DAMAGE,
+      damage,
       this.time.now,
     );
     if (updatedHealth === undefined) {
@@ -1465,6 +1475,7 @@ class GameScene extends Phaser.Scene {
       );
     }
 
+    this.updateSelfDestructMonsters();
     this.updateMonsterMovement();
     this.updateProjectileMovement(delta);
     this.updateRadar();
@@ -1473,6 +1484,10 @@ class GameScene extends Phaser.Scene {
   private updateMonsterMovement() {
     for (const child of this.monsters.getChildren()) {
       if (!(child instanceof Phaser.Physics.Arcade.Sprite) || !child.active) {
+        continue;
+      }
+      if (child.getData('selfDestructStartedAt') !== undefined) {
+        child.setVelocity(0, 0);
         continue;
       }
 
@@ -1497,6 +1512,69 @@ class GameScene extends Phaser.Scene {
         direction.y * speed,
       );
     }
+  }
+
+  private updateSelfDestructMonsters() {
+    this.selfDestructWarningGraphics.clear();
+    for (const child of [...this.monsters.getChildren()]) {
+      if (
+        !(child instanceof Phaser.Physics.Arcade.Sprite)
+        || !child.active
+        || child.getData('dead')
+        || child.getData('monsterId') !== 'yellowBat'
+      ) {
+        continue;
+      }
+
+      const distance = Phaser.Math.Distance.Between(
+        child.x,
+        child.y,
+        this.player.x,
+        this.player.y,
+      );
+      let startedAt: unknown = child.getData('selfDestructStartedAt');
+      if (startedAt === undefined && isWithinSelfDestructRadius(distance)) {
+        startedAt = this.time.now;
+        child.setData('selfDestructStartedAt', startedAt);
+      }
+      if (typeof startedAt !== 'number') {
+        continue;
+      }
+
+      const warningState = getSelfDestructWarningState(this.time.now - startedAt);
+      if (warningState === 'detonate') {
+        this.detonateMonster(child);
+        continue;
+      }
+      if (warningState === 'warning-on') {
+        this.selfDestructWarningGraphics.fillStyle(0xff0000, 0.18);
+        this.selfDestructWarningGraphics.fillCircle(child.x, child.y, SELF_DESTRUCT_RADIUS);
+        this.selfDestructWarningGraphics.lineStyle(3, 0xff2222, 0.95);
+        this.selfDestructWarningGraphics.strokeCircle(child.x, child.y, SELF_DESTRUCT_RADIUS);
+      }
+    }
+  }
+
+  private detonateMonster(monster: Phaser.Physics.Arcade.Sprite) {
+    monster.setData('dead', true);
+    const body = monster.body as Phaser.Physics.Arcade.Body;
+    body.setVelocity(0, 0);
+    body.enable = false;
+
+    const distance = Phaser.Math.Distance.Between(
+      monster.x,
+      monster.y,
+      this.player.x,
+      this.player.y,
+    );
+    const result = resolveSelfDestruct(distance);
+    if (result.playerDamage > 0) {
+      this.damagePlayer(result.playerDamage);
+    }
+    if (result.experienceReward > 0) {
+      this.gainExperience(result.experienceReward);
+    }
+    monster.destroy();
   }
 
   private getCharacterWeaponRange(weaponId: WeaponId, weaponLevel: number) {
