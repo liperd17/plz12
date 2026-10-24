@@ -202,6 +202,13 @@ test('basic and rapid projectile ranges match the updated workbook', () => {
   assert.equal(createProjectileShot('rapidAttackA', 0, 0, 401, 0, 1), undefined);
 });
 
+test('global stat multipliers increase projectile range and damage', () => {
+  const shot = createProjectileShot('basicAttack', 0, 0, 420, 0, 1, 1.05, 1.05);
+
+  assert.equal(shot?.range, 420);
+  assert.equal(shot?.damage, 10.5);
+});
+
 test('slash line hits points within its width and length only', () => {
   assert.equal(isWithinAttackLine(0, 0, 100, 0, 50, 25, 50), true);
   assert.equal(isWithinAttackLine(0, 0, 100, 0, 50, 26, 50), false);

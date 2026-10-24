@@ -207,6 +207,7 @@ export function createProjectileShot(
   targetY: number,
   weaponLevel: number,
   rangeMultiplier = 1,
+  damageMultiplier = 1,
 ): WeaponProjectile | undefined {
   const weapon = WEAPONS[weaponId];
   if (weapon.attackMode !== 'projectile') {
@@ -234,7 +235,7 @@ export function createProjectileShot(
 
   return {
     ...velocity,
-    damage: getWeaponDamage(weaponId, Math.max(0, weaponLevel - 1)),
+    damage: getWeaponDamage(weaponId, Math.max(0, weaponLevel - 1)) * damageMultiplier,
     range: effectiveRange,
     hasPiercingAttribute: weapon.attackAttribute === 'piercing',
   };

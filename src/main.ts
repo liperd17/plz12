@@ -12,6 +12,16 @@ import {
 } from './monsters.ts';
 import { PLAYER_INVULNERABILITY_DURATION, PlayerDamageState } from './playerDamage.ts';
 import {
+  applyMaxHealthUpgrade,
+  createStatUpgradeLevels,
+  getAttackIntervalSeconds,
+  getStatMultiplier,
+  rollUpgradeChoiceKinds,
+  STAT_UPGRADE_IDS,
+  STAT_UPGRADES,
+  type StatUpgradeId,
+} from './upgrades.ts';
+import {
   applyDamageToHealth,
   advanceProjectile,
   createProjectileBurst,
@@ -87,7 +97,8 @@ type NavigationNode = {
   edges: NavigationEdge[];
 };
 
-type UpgradeChoice = {
+type WeaponUpgradeChoice = {
+  kind: 'weapon';
   weaponId: WeaponId;
   currentLevel: number;
   currentDamage: number;
@@ -96,8 +107,19 @@ type UpgradeChoice = {
   upgradedRange: number;
   currentProjectileCount: number;
   upgradedProjectileCount: number;
+  attackIntervalSeconds: number;
   unlocksBonus: boolean;
 };
+
+type StatUpgradeChoice = {
+  kind: 'stat';
+  statId: StatUpgradeId;
+  currentLevel: number;
+  currentMultiplier: number;
+  upgradedMultiplier: number;
+};
+
+type UpgradeChoice = WeaponUpgradeChoice | StatUpgradeChoice;
 
 type StoredWeaponId = WeaponId | typeof TEMPORARY_WEAPON_ID;
 
@@ -298,6 +320,7 @@ class GameScene extends Phaser.Scene {
   private radarGraphics!: Phaser.GameObjects.Graphics;
   private selfDestructWarningGraphics!: Phaser.GameObjects.Graphics;
   private playerHealth = PLAYER_MAX_HEALTH;
+  private playerMaxHealth = PLAYER_MAX_HEALTH;
   private playerHealthFill!: Phaser.GameObjects.Rectangle;
   private playerHealthText!: Phaser.GameObjects.Text;
   private experience = 0;
@@ -314,6 +337,7 @@ class GameScene extends Phaser.Scene {
     rapidAttackA: 0,
     slashAttack: 0,
   };
+  private statUpgradeLevels = createStatUpgradeLevels();
   private radarRadius = RADAR_RADIUS;
   private gameOverOverlay!: Array<Phaser.GameObjects.Rectangle | Phaser.GameObjects.Text>;
   private obstaclePlacements: ObstaclePlacement[] = [];
@@ -333,6 +357,7 @@ class GameScene extends Phaser.Scene {
   create(data?: { characterId?: CharacterId }) {
     this.characterId = data?.characterId === 'red' ? 'red' : 'green';
     this.playerHealth = PLAYER_MAX_HEALTH;
+    this.playerMaxHealth = PLAYER_MAX_HEALTH;
     this.experience = 0;
     this.experienceToNextLevel = PLAYER_START_XP_REQUIREMENT;
     this.playerLevel = PLAYER_START_LEVEL;
@@ -343,6 +368,7 @@ class GameScene extends Phaser.Scene {
       rapidAttackA: 0,
       slashAttack: 0,
     };
+    this.statUpgradeLevels = createStatUpgradeLevels();
     this.radarRadius = RADAR_RADIUS;
     this.playerDamage.reset();
     this.isGameOver = false;
@@ -652,10 +678,10 @@ class GameScene extends Phaser.Scene {
 
   private updatePlayerHealthHud() {
     this.playerHealthFill.setSize(
-      PLAYER_HEALTH_BAR_WIDTH * (this.playerHealth / PLAYER_MAX_HEALTH),
+      PLAYER_HEALTH_BAR_WIDTH * (this.playerHealth / this.playerMaxHealth),
       PLAYER_HEALTH_BAR_HEIGHT,
     );
-    this.playerHealthText.setText(`HP ${this.playerHealth} / ${PLAYER_MAX_HEALTH}`);
+    this.playerHealthText.setText(`HP ${this.playerHealth} / ${this.playerMaxHealth}`);
   }
 
   private updateExperienceHud() {
@@ -761,27 +787,58 @@ class GameScene extends Phaser.Scene {
         this.weaponLevels[weaponId] > 0
         || this.storedWeapons.length < WEAPON_STORAGE_CAPACITY,
     );
-    const choices = Phaser.Utils.Array.Shuffle(availableWeapons)
-      .slice(0, 3)
-      .map((weaponId): UpgradeChoice => {
+    const weaponPool = Phaser.Utils.Array.Shuffle([...availableWeapons]);
+    const statPool = Phaser.Utils.Array.Shuffle([...STAT_UPGRADE_IDS]);
+    const choiceKinds = rollUpgradeChoiceKinds(
+      Array.from({ length: 3 }, () => Phaser.Math.RND.frac()),
+    );
+    const damageMultiplier = getStatMultiplier(this.statUpgradeLevels.damage);
+    const choices = choiceKinds.map((kind): UpgradeChoice => {
+      if (kind === 'weapon') {
+        const weaponId = weaponPool.shift();
+        if (weaponId === undefined) {
+          throw new Error('Unable to create a weapon upgrade choice from the available pool.');
+        }
         const currentLevel = this.weaponLevels[weaponId];
         return {
+          kind: 'weapon',
           weaponId,
           currentLevel,
-          currentDamage: getWeaponDamage(weaponId, Math.max(0, currentLevel - 1)),
-          upgradedDamage: getWeaponDamage(weaponId, currentLevel),
+          currentDamage:
+            getWeaponDamage(weaponId, Math.max(0, currentLevel - 1)) * damageMultiplier,
+          upgradedDamage: getWeaponDamage(weaponId, currentLevel) * damageMultiplier,
           currentRange: this.getCharacterWeaponRange(weaponId, currentLevel),
           upgradedRange: this.getCharacterWeaponRange(weaponId, currentLevel + 1),
           currentProjectileCount: getWeaponProjectileCount(weaponId, currentLevel),
           upgradedProjectileCount: getWeaponProjectileCount(weaponId, currentLevel + 1),
+          attackIntervalSeconds: this.getWeaponAttackIntervalMs(weaponId) / 1000,
           unlocksBonus: willUnlockWeaponBonusAtNextLevel(weaponId, currentLevel),
         };
-      });
+      }
+
+      const statId = statPool.shift();
+      if (statId === undefined) {
+        throw new Error('Unable to create a stat upgrade choice from the available pool.');
+      }
+      const currentLevel = this.statUpgradeLevels[statId];
+      return {
+        kind: 'stat',
+        statId,
+        currentLevel,
+        currentMultiplier: getStatMultiplier(currentLevel),
+        upgradedMultiplier: getStatMultiplier(currentLevel + 1),
+      };
+    });
     this.scene.launch('upgrade', choices);
     this.scene.pause();
   }
 
   applyUpgrade(choice: UpgradeChoice) {
+    if (choice.kind === 'stat') {
+      this.applyStatUpgrade(choice.statId);
+      return;
+    }
+
     const currentLevel = this.weaponLevels[choice.weaponId];
     if (
       currentLevel === 0
@@ -796,6 +853,25 @@ class GameScene extends Phaser.Scene {
     }
     this.weaponLevels[choice.weaponId] += 1;
     this.updateWeaponStorageHud();
+  }
+
+  private applyStatUpgrade(statId: StatUpgradeId) {
+    const currentLevel = this.statUpgradeLevels[statId];
+    this.statUpgradeLevels[statId] = currentLevel + 1;
+
+    if (statId === 'maxHealth') {
+      const upgradedHealth = applyMaxHealthUpgrade(
+        this.playerHealth,
+        PLAYER_MAX_HEALTH,
+        currentLevel,
+      );
+      this.playerHealth = upgradedHealth.currentHealth;
+      this.playerMaxHealth = upgradedHealth.maxHealth;
+      this.updatePlayerHealthHud();
+    }
+    if (statId === 'attackSpeed') {
+      this.refreshWeaponTimers();
+    }
   }
 
   private spawnMonsterOnTimer() {
@@ -1206,10 +1282,27 @@ class GameScene extends Phaser.Scene {
     }
 
     this.weaponTimers.set(weaponId, this.time.addEvent({
-      delay: WEAPONS[weaponId].attackIntervalSeconds * 1000,
+      delay: this.getWeaponAttackIntervalMs(weaponId),
       loop: true,
       callback: () => this.fireWeapon(weaponId),
     }));
+  }
+
+  private refreshWeaponTimers() {
+    for (const [weaponId, timer] of this.weaponTimers) {
+      timer.reset({
+        delay: this.getWeaponAttackIntervalMs(weaponId),
+        loop: true,
+        callback: () => this.fireWeapon(weaponId),
+      });
+    }
+  }
+
+  private getWeaponAttackIntervalMs(weaponId: WeaponId) {
+    return getAttackIntervalSeconds(
+      WEAPONS[weaponId].attackIntervalSeconds,
+      this.statUpgradeLevels.attackSpeed,
+    ) * 1000;
   }
 
   private fireWeapon(weaponId: WeaponId) {
@@ -1254,7 +1347,9 @@ class GameScene extends Phaser.Scene {
           launchTarget.x,
           launchTarget.y,
           weaponLevel,
-          CHARACTERS[this.characterId].effectiveRangeMultiplier,
+          CHARACTERS[this.characterId].effectiveRangeMultiplier
+            * getStatMultiplier(this.statUpgradeLevels.range),
+          getStatMultiplier(this.statUpgradeLevels.damage),
         );
         if (!projectileShot) {
           return;
@@ -1300,7 +1395,8 @@ class GameScene extends Phaser.Scene {
     slashEffect.lineBetween(this.player.x, this.player.y, endX, endY);
     this.time.delayedCall(120, () => slashEffect.destroy());
 
-    const damage = getWeaponDamage(weaponId, this.weaponLevels[weaponId] - 1);
+    const damage = getWeaponDamage(weaponId, this.weaponLevels[weaponId] - 1)
+      * getStatMultiplier(this.statUpgradeLevels.damage);
     for (const child of this.monsters.getChildren()) {
       if (
         !(child instanceof Phaser.Physics.Arcade.Sprite)
@@ -1470,8 +1566,14 @@ class GameScene extends Phaser.Scene {
     } else {
       direction.normalize();
       this.playerBody.setVelocity(
-        direction.x * PLAYER_SPEED * CHARACTERS[this.characterId].movementSpeedMultiplier,
-        direction.y * PLAYER_SPEED * CHARACTERS[this.characterId].movementSpeedMultiplier,
+        direction.x
+          * PLAYER_SPEED
+          * CHARACTERS[this.characterId].movementSpeedMultiplier
+          * getStatMultiplier(this.statUpgradeLevels.movementSpeed),
+        direction.y
+          * PLAYER_SPEED
+          * CHARACTERS[this.characterId].movementSpeedMultiplier
+          * getStatMultiplier(this.statUpgradeLevels.movementSpeed),
       );
     }
 
@@ -1581,7 +1683,7 @@ class GameScene extends Phaser.Scene {
     return getCharacterEffectiveRange(
       getWeaponEffectiveRange(weaponId, weaponLevel),
       this.characterId,
-    );
+    ) * getStatMultiplier(this.statUpgradeLevels.range);
   }
 
   private updateRadar() {
@@ -1616,7 +1718,7 @@ class UpgradeScene extends Phaser.Scene {
       fontSize: '42px',
       fontStyle: 'bold',
     }).setOrigin(0.5).setScrollFactor(0);
-    this.add.text(GAME_WIDTH / 2, 176, 'Choose a weapon', {
+    this.add.text(GAME_WIDTH / 2, 176, 'Choose an upgrade', {
       color: '#cbd5e1',
       fontFamily: 'sans-serif',
       fontSize: '20px',
@@ -1627,35 +1729,63 @@ class UpgradeScene extends Phaser.Scene {
     const cardY = GAME_HEIGHT / 2 + 25;
     const cardCenters = [210, GAME_WIDTH / 2, GAME_WIDTH - 210];
     for (const [index, choice] of choices.entries()) {
-      const weapon = WEAPONS[choice.weaponId];
-      const isNewWeapon = choice.currentLevel === 0;
-      const titleColor = choice.unlocksBonus
-        ? '#ffe08a'
-        : isNewWeapon
-          ? '#8bd3ff'
-          : '#ffd166';
-      const status = choice.unlocksBonus
-        ? 'LEVEL 5 BONUS!'
-        : isNewWeapon
-          ? 'NEW WEAPON'
-          : `WEAPON LV ${choice.currentLevel} → ${choice.currentLevel + 1}`;
-      const description = [
-        isNewWeapon
-          ? `Damage ${choice.upgradedDamage}`
-          : `Damage ${choice.currentDamage} → ${choice.upgradedDamage}`,
-        `Interval ${weapon.attackIntervalSeconds}s`,
-        choice.currentRange === choice.upgradedRange
-          ? `Range ${choice.upgradedRange}px`
-          : `Range ${choice.currentRange} → ${choice.upgradedRange}px`,
-        choice.currentProjectileCount === choice.upgradedProjectileCount
-          ? `Projectiles ${choice.upgradedProjectileCount}`
-          : `Projectiles ${choice.currentProjectileCount} → ${choice.upgradedProjectileCount}`,
-        ...(choice.unlocksBonus
-          ? [getWeaponBonusDescription(choice.weaponId) ?? 'Level 5 bonus unlocked']
-          : []),
-      ].join('\n');
-      const cardColor = choice.unlocksBonus ? 0x3a3320 : 0x1e293b;
-      const cardHoverColor = choice.unlocksBonus ? 0x514522 : 0x293b52;
+      let title: string;
+      let titleColor: string;
+      let status: string;
+      let description: string;
+      let cardColor: number;
+      let cardHoverColor: number;
+      let strokeWidth: number;
+      let strokeColor: number;
+
+      if (choice.kind === 'weapon') {
+        const weapon = WEAPONS[choice.weaponId];
+        const isNewWeapon = choice.currentLevel === 0;
+        title = weapon.name;
+        titleColor = choice.unlocksBonus
+          ? '#ffe08a'
+          : isNewWeapon
+            ? '#8bd3ff'
+            : '#ffd166';
+        status = choice.unlocksBonus
+          ? 'LEVEL 5 BONUS!'
+          : isNewWeapon
+            ? 'NEW WEAPON'
+            : `WEAPON LV ${choice.currentLevel} → ${choice.currentLevel + 1}`;
+        description = [
+          isNewWeapon
+            ? `Damage ${Number(choice.upgradedDamage.toFixed(2))}`
+            : `Damage ${Number(choice.currentDamage.toFixed(2))} → ${Number(choice.upgradedDamage.toFixed(2))}`,
+          `Interval ${Number(choice.attackIntervalSeconds.toFixed(3))}s`,
+          choice.currentRange === choice.upgradedRange
+            ? `Range ${Number(choice.upgradedRange.toFixed(2))}px`
+            : `Range ${Number(choice.currentRange.toFixed(2))} → ${Number(choice.upgradedRange.toFixed(2))}px`,
+          choice.currentProjectileCount === choice.upgradedProjectileCount
+            ? `Projectiles ${choice.upgradedProjectileCount}`
+            : `Projectiles ${choice.currentProjectileCount} → ${choice.upgradedProjectileCount}`,
+          ...(choice.unlocksBonus
+            ? [getWeaponBonusDescription(choice.weaponId) ?? 'Level 5 bonus unlocked']
+            : []),
+        ].join('\n');
+        cardColor = choice.unlocksBonus ? 0x3a3320 : 0x1e293b;
+        cardHoverColor = choice.unlocksBonus ? 0x514522 : 0x293b52;
+        strokeWidth = choice.unlocksBonus ? 5 : 3;
+        strokeColor = choice.unlocksBonus || !isNewWeapon ? 0xf4b942 : 0x38a9ff;
+      } else {
+        const stat = STAT_UPGRADES[choice.statId];
+        title = stat.name;
+        titleColor = '#86efac';
+        status = `STAT LV ${choice.currentLevel} → ${choice.currentLevel + 1}`;
+        description = [
+          stat.description,
+          `${Math.round(choice.currentMultiplier * 100)}% → ${Math.round(choice.upgradedMultiplier * 100)}%`,
+          '기본값 기준 +5%',
+        ].join('\n');
+        cardColor = 0x18352b;
+        cardHoverColor = 0x22513f;
+        strokeWidth = 3;
+        strokeColor = 0x4ade80;
+      }
       const card = this.add.rectangle(
         cardCenters[index],
         cardY,
@@ -1664,10 +1794,7 @@ class UpgradeScene extends Phaser.Scene {
         cardColor,
         0.98,
       );
-      card.setStrokeStyle(
-        choice.unlocksBonus ? 5 : 3,
-        choice.unlocksBonus || !isNewWeapon ? 0xf4b942 : 0x38a9ff,
-      );
+      card.setStrokeStyle(strokeWidth, strokeColor);
       card.setScrollFactor(0);
       card.setInteractive({ useHandCursor: true });
       card.on('pointerover', () => card.setFillStyle(cardHoverColor, 1));
@@ -1680,7 +1807,7 @@ class UpgradeScene extends Phaser.Scene {
         fontSize: '18px',
         fontStyle: 'bold',
       }).setOrigin(0.5).setScrollFactor(0);
-      this.add.text(cardCenters[index], cardY - 28, weapon.name, {
+      this.add.text(cardCenters[index], cardY - 28, title, {
         color: '#ffffff',
         fontFamily: 'sans-serif',
         fontSize: '24px',

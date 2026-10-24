@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "test": "node --experimental-strip-types --test tests/playerDamage.test.mjs tests/weapons.test.mjs tests/characters.test.mjs tests/monsters.test.mjs",
+    "test": "node --experimental-strip-types --test tests/playerDamage.test.mjs tests/weapons.test.mjs tests/characters.test.mjs tests/monsters.test.mjs tests/upgrades.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
